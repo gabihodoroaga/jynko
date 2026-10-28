@@ -1,0 +1,222 @@
+package main
+
+import (
+	"context"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"jynko/internal/config"
+	"jynko/internal/handler"
+	"jynko/internal/middleware"
+	"jynko/internal/model"
+	"jynko/internal/repository"
+	"jynko/internal/service"
+)
+
+func main() {
+	cfg := config.Load()
+
+	ctx := context.Background()
+	firestoreClient, err := repository.NewFirestoreClient(ctx, cfg.GoogleCloudProject, cfg.FirestoreDatabaseID)
+	if err != nil {
+		log.Fatalf("failed to initialize Firestore client: %v", err)
+	}
+	defer func() {
+		_ = firestoreClient.Close()
+	}()
+
+	if err := repository.EnsureSeedData(ctx, firestoreClient); err != nil {
+		log.Printf("warning: failed to ensure Firestore seed data: %v", err)
+	}
+
+	// Repositories
+	projectRepo := repository.NewProjectRepository(firestoreClient)
+	moduleRepo := repository.NewModuleRepository(firestoreClient)
+	epicRepo := repository.NewEpicRepository(firestoreClient)
+	cycleRepo := repository.NewCycleRepository(firestoreClient)
+	labelRepo := repository.NewLabelRepository(firestoreClient)
+	itemRepo := repository.NewItemRepository(firestoreClient)
+	pageRepo := repository.NewPageRepository(firestoreClient)
+	stickyRepo := repository.NewStickyRepository(firestoreClient)
+
+	// Services
+	projectSvc := service.NewProjectService(projectRepo)
+	moduleSvc := service.NewModuleService(moduleRepo)
+	epicSvc := service.NewEpicService(epicRepo)
+	cycleSvc := service.NewCycleService(cycleRepo)
+	labelSvc := service.NewLabelService(labelRepo)
+	itemSvc := service.NewItemService(itemRepo)
+	pageSvc := service.NewPageService(pageRepo)
+	stickySvc := service.NewStickyService(stickyRepo)
+
+	// Handlers
+	authHandler := handler.NewAuthHandler()
+	projectHandler := handler.NewProjectHandler(projectSvc)
+	moduleHandler := handler.NewModuleHandler(moduleSvc)
+	epicHandler := handler.NewEpicHandler(epicSvc)
+	cycleHandler := handler.NewCycleHandler(cycleSvc)
+	labelHandler := handler.NewLabelHandler(labelSvc)
+	itemHandler := handler.NewItemHandler(itemSvc)
+	commentHandler := handler.NewCommentHandler(itemSvc)
+	pageHandler := handler.NewPageHandler(pageSvc)
+	stickyHandler := handler.NewStickyHandler(stickySvc)
+
+	router := SetupRouter(
+		cfg,
+		projectRepo,
+		authHandler,
+		projectHandler,
+		moduleHandler,
+		epicHandler,
+		cycleHandler,
+		labelHandler,
+		itemHandler,
+		commentHandler,
+		pageHandler,
+		stickyHandler,
+	)
+
+	srv := &http.Server{
+		Addr:    ":" + cfg.Port,
+		Handler: router,
+	}
+
+	go func() {
+		log.Printf("Jynko server listening on :%s (env=%s, gcp_project=%s)", cfg.Port, cfg.Env, cfg.GoogleCloudProject)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("server error: %v", err)
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(shutdownCtx)
+}
+
+// SetupRouter configures all Gin routes and middleware under /api/v1.
+func SetupRouter(
+	cfg *config.Config,
+	projectRepo repository.ProjectRepository,
+	authHandler *handler.AuthHandler,
+	projectHandler *handler.ProjectHandler,
+	moduleHandler *handler.ModuleHandler,
+	epicHandler *handler.EpicHandler,
+	cycleHandler *handler.CycleHandler,
+	labelHandler *handler.LabelHandler,
+	itemHandler *handler.ItemHandler,
+	commentHandler *handler.CommentHandler,
+	pageHandler *handler.PageHandler,
+	stickyHandler *handler.StickyHandler,
+) *gin.Engine {
+	r := gin.New()
+	r.Use(gin.Logger(), gin.Recovery())
+	r.Use(middleware.CORSMiddleware(cfg.CORSAllowedOrigins))
+
+	r.GET("/healthz", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	})
+
+	api := r.Group("/api/v1")
+	api.Use(middleware.IAPAuthMiddleware(cfg))
+
+	// Auth identity endpoint
+	api.GET("/auth/me", authHandler.GetMe)
+
+	// Top-level Projects
+	api.GET("/projects", projectHandler.ListProjects)
+	api.POST("/projects", projectHandler.CreateProject)
+
+	// Project-scoped routes with RBAC middleware
+	projGroup := api.Group("/projects/:projectId")
+	{
+		viewer := middleware.RequireProjectRole(projectRepo, model.RoleViewer)
+		member := middleware.RequireProjectRole(projectRepo, model.RoleMember)
+		admin := middleware.RequireProjectRole(projectRepo, model.RoleAdmin)
+
+		// Project Details & Settings
+		projGroup.GET("", viewer, projectHandler.GetProject)
+		projGroup.PATCH("", admin, projectHandler.UpdateProject)
+		projGroup.DELETE("", admin, projectHandler.DeleteProject)
+
+		// RBAC Members
+		projGroup.GET("/members", viewer, projectHandler.ListMembers)
+		projGroup.POST("/members", admin, projectHandler.UpsertMember)
+		projGroup.DELETE("/members/:userId", admin, projectHandler.RemoveMember)
+
+		// Modules
+		projGroup.GET("/modules", viewer, moduleHandler.ListModules)
+		projGroup.POST("/modules", member, moduleHandler.CreateModule)
+		projGroup.PATCH("/modules/:moduleId", member, moduleHandler.UpdateModule)
+		projGroup.DELETE("/modules/:moduleId", member, moduleHandler.DeleteModule)
+
+		// Epics
+		projGroup.GET("/epics", viewer, epicHandler.ListEpics)
+		projGroup.POST("/epics", member, epicHandler.CreateEpic)
+		projGroup.PATCH("/epics/:epicId", member, epicHandler.UpdateEpic)
+		projGroup.DELETE("/epics/:epicId", member, epicHandler.DeleteEpic)
+
+		// Cycles
+		projGroup.GET("/cycles", viewer, cycleHandler.ListCycles)
+		projGroup.POST("/cycles", member, cycleHandler.CreateCycle)
+		projGroup.PATCH("/cycles/:cycleId", member, cycleHandler.UpdateCycle)
+		projGroup.DELETE("/cycles/:cycleId", member, cycleHandler.DeleteCycle)
+
+		// Labels
+		projGroup.GET("/labels", viewer, labelHandler.ListLabels)
+		projGroup.POST("/labels", member, labelHandler.CreateLabel)
+		projGroup.PATCH("/labels/:labelId", member, labelHandler.UpdateLabel)
+		projGroup.DELETE("/labels/:labelId", member, labelHandler.DeleteLabel)
+
+		// Work Items
+		projGroup.GET("/items", viewer, itemHandler.ListItems)
+		projGroup.POST("/items", member, itemHandler.CreateItem)
+		projGroup.GET("/items/:itemId", viewer, itemHandler.GetItem)
+		projGroup.PATCH("/items/:itemId", member, itemHandler.UpdateItem)
+		projGroup.DELETE("/items/:itemId", member, itemHandler.DeleteItem)
+
+		// Sub-Items
+		projGroup.GET("/items/:itemId/sub-items", viewer, itemHandler.ListSubItems)
+		projGroup.POST("/items/:itemId/sub-items", member, itemHandler.CreateSubItem)
+		projGroup.PATCH("/items/:itemId/sub-items/:subItemId", member, itemHandler.UpdateSubItem)
+		projGroup.DELETE("/items/:itemId/sub-items/:subItemId", member, itemHandler.DeleteSubItem)
+
+		// Comments
+		projGroup.GET("/items/:itemId/comments", viewer, commentHandler.ListComments)
+		projGroup.POST("/items/:itemId/comments", member, commentHandler.CreateComment)
+		projGroup.DELETE("/items/:itemId/comments/:commentId", member, commentHandler.DeleteComment)
+
+		// Wiki Pages & Versions
+		projGroup.GET("/pages", viewer, pageHandler.ListPages)
+		projGroup.POST("/pages", member, pageHandler.CreatePage)
+		projGroup.GET("/pages/:pageId", viewer, pageHandler.GetPage)
+		projGroup.PUT("/pages/:pageId", member, pageHandler.UpdatePage)
+		projGroup.PATCH("/pages/:pageId/lock", member, pageHandler.SetPageLock)
+		projGroup.DELETE("/pages/:pageId", member, pageHandler.DeletePage)
+		projGroup.GET("/pages/:pageId/versions", viewer, pageHandler.ListVersions)
+		projGroup.POST("/pages/:pageId/versions/:versionId/restore", member, pageHandler.RestoreVersion)
+
+		// Page Collections
+		projGroup.GET("/collections", viewer, pageHandler.ListCollections)
+		projGroup.POST("/collections", member, pageHandler.CreateCollection)
+		projGroup.PATCH("/collections/:collectionId", member, pageHandler.UpdateCollection)
+		projGroup.DELETE("/collections/:collectionId", member, pageHandler.DeleteCollection)
+
+		// Stickies
+		projGroup.GET("/stickies", viewer, stickyHandler.ListStickies)
+		projGroup.POST("/stickies", member, stickyHandler.CreateSticky)
+		projGroup.PATCH("/stickies/:stickyId", member, stickyHandler.UpdateSticky)
+		projGroup.DELETE("/stickies/:stickyId", member, stickyHandler.DeleteSticky)
+	}
+
+	return r
+}

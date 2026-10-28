@@ -1,0 +1,50 @@
+name: Jynko E2E & CI Pipeline
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  e2e:
+    name: Backend, Frontend & Go-Rod UI E2E Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache-dependency-path: backend/go.sum
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Frontend Dependencies & Build
+        working-directory: frontend
+        run: |
+          npm ci
+          npx ng build
+
+      - name: Build & Unit Test Backend
+        working-directory: backend
+        run: |
+          go build ./...
+          go test ./internal/middleware/... ./internal/service/... ./internal/agent/...
+
+      - name: Run Go-Rod End-to-End UI Tests
+        run: ./scripts/run-e2e.sh "${{ runner.temp }}/jynko-e2e-artifacts"
+
+      - name: Upload E2E Screenshots & Validation Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jynko-e2e-screenshots-and-report
+          path: ${{ runner.temp }}/jynko-e2e-artifacts
